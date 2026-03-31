@@ -1,0 +1,13 @@
+{
+  "adapter_type": "lora",
+  "style": "proust",
+  "lora_rank": 16,
+  "lora_alpha": 32.0,
+  "train_rows": 5,
+  "avg_losses": {
+    "nll": 1.027309691167178,
+    "sem": 0.3325176456501638,
+    "style": 2.5801628774869028,
+    "total": 2.5501534818657436
+  }
+}

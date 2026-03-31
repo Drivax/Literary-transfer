@@ -1,0 +1,25 @@
+{
+  "overall": {
+    "n_samples": 10,
+    "semantic_similarity_cosine": 0.6083,
+    "stylometric_perplexity_proxy": 35.3533,
+    "avg_sentence_length_shift": 8.8667,
+    "distinct_2": 0.9958
+  },
+  "by_style": {
+    "dostoevsky": {
+      "n_samples": 5,
+      "semantic_similarity_cosine": 0.6365,
+      "stylometric_perplexity_proxy": 41.1396,
+      "avg_sentence_length_shift": 8.8667,
+      "distinct_2": 0.9956
+    },
+    "proust": {
+      "n_samples": 5,
+      "semantic_similarity_cosine": 0.5801,
+      "stylometric_perplexity_proxy": 29.567,
+      "avg_sentence_length_shift": 8.8667,
+      "distinct_2": 0.9961
+    }
+  }
+}

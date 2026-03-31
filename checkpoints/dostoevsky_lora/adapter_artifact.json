@@ -1,0 +1,13 @@
+{
+  "adapter_type": "lora",
+  "style": "dostoevsky",
+  "lora_rank": 16,
+  "lora_alpha": 32.0,
+  "train_rows": 5,
+  "avg_losses": {
+    "nll": 1.0000339937938871,
+    "sem": 0.35006389491771167,
+    "style": 3.6787751661550123,
+    "total": 3.0844663033137913
+  }
+}
