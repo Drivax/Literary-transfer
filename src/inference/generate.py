@@ -202,7 +202,7 @@ def candidates_lm(
     profile = _resolve_profile(lm_profile, model_name)
     tokenizer, model, is_seq2seq = _load_lm(profile["model_name"])
     prompt = _build_prompt(text, style)
-    model_inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
+    model_inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
     model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
 
     candidates = []
@@ -210,14 +210,15 @@ def candidates_lm(
     seen = set()
     temp_cycle = profile["temperatures"]
     top_p_cycle = profile["top_ps"]
-    attempts = n + (12 if strict_quality else 4)
+    attempts = n + (6 if strict_quality else 4)
 
     for i in range(attempts):
         if len(candidates) >= n:
             break
         run_seed = seed + i if seed is not None else _stable_seed(f"{text}|{style}|{i}")
-        generator = torch.Generator(device=model.device)
-        generator.manual_seed(run_seed)
+        torch.manual_seed(run_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(run_seed)
 
         temperature = temp_cycle[i % len(temp_cycle)]
         top_p = top_p_cycle[i % len(top_p_cycle)]
@@ -233,7 +234,6 @@ def candidates_lm(
                 max_new_tokens=max_new_tokens,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
-                generator=generator,
             )
 
         decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
