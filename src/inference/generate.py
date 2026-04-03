@@ -7,10 +7,12 @@ import sys
 
 try:
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 except ImportError:
     torch = None
+    AutoConfig = None
     AutoModelForCausalLM = None
+    AutoModelForSeq2SeqLM = None
     AutoTokenizer = None
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,8 +24,31 @@ try:
 except ImportError:
     from rerank import rank_candidates
 
+try:
+    from ..utils.text_stats import distinct_ngrams, tokenize
+except ImportError:
+    from utils.text_stats import distinct_ngrams, tokenize
+
 
 _MODEL_CACHE = {}
+
+
+MODEL_PROFILES = {
+    "legacy": {
+        "model_name": "distilgpt2",
+        "temperatures": [0.65, 0.75, 0.85, 0.95],
+        "top_ps": [0.88, 0.9, 0.93, 0.96],
+        "repetition_penalty": 1.12,
+        "no_repeat_ngram_size": 3,
+    },
+    "instruct": {
+        "model_name": "google/flan-t5-small",
+        "temperatures": [0.55, 0.62, 0.7, 0.78],
+        "top_ps": [0.82, 0.86, 0.9, 0.92],
+        "repetition_penalty": 1.18,
+        "no_repeat_ngram_size": 4,
+    },
+}
 
 
 def normalize_style(style):
@@ -41,6 +66,15 @@ def normalize_style(style):
 def _stable_seed(text):
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return int(digest[:12], 16)
+
+
+def _resolve_profile(profile_name, model_name):
+    if profile_name not in MODEL_PROFILES:
+        raise ValueError(f"lm_profile must be one of: {', '.join(sorted(MODEL_PROFILES))}")
+    profile = dict(MODEL_PROFILES[profile_name])
+    if model_name:
+        profile["model_name"] = model_name
+    return profile
 
 
 def _sample_topk(ranked, top_k=3, temperature=0.35, seed=None):
@@ -62,7 +96,7 @@ def _sample_topk(ranked, top_k=3, temperature=0.35, seed=None):
 
 
 def _load_lm(model_name):
-    if AutoModelForCausalLM is None or AutoTokenizer is None or torch is None:
+    if AutoConfig is None or AutoModelForCausalLM is None or AutoModelForSeq2SeqLM is None or AutoTokenizer is None or torch is None:
         raise ImportError(
             "Missing dependencies for LM generation. Install 'transformers' and 'torch'."
         )
@@ -70,13 +104,22 @@ def _load_lm(model_name):
         return _MODEL_CACHE[model_name]
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token_id is None:
+    config = AutoConfig.from_pretrained(model_name)
+    if getattr(config, "is_encoder_decoder", False):
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        is_seq2seq = True
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        is_seq2seq = False
+
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
     model.eval()
-    _MODEL_CACHE[model_name] = (tokenizer, model)
-    return tokenizer, model
+    _MODEL_CACHE[model_name] = (tokenizer, model, is_seq2seq)
+    return tokenizer, model, is_seq2seq
 
 
 def _style_instructions(style):
@@ -121,51 +164,104 @@ def _extract_rewrite(prompt, decoded):
     return candidate
 
 
-def candidates_lm(text, style, n=4, seed=None, model_name="distilgpt2", max_new_tokens=96):
-    tokenizer, model = _load_lm(model_name)
+def _passes_quality_filter(source, candidate, style, min_semantic, min_style, min_length_ratio):
+    source_tokens = tokenize(source)
+    cand_tokens = tokenize(candidate)
+    if len(cand_tokens) < 8:
+        return False
+
+    semantic = rank_candidates(source, [candidate], style)[0][3]
+    style_score = rank_candidates(source, [candidate], style)[0][2]
+    length_ratio = len(cand_tokens) / max(1, len(source_tokens))
+    distinct2 = distinct_ngrams(cand_tokens, n=2)
+
+    if semantic < min_semantic:
+        return False
+    if style_score < min_style:
+        return False
+    if length_ratio < min_length_ratio:
+        return False
+    if distinct2 < 0.55:
+        return False
+    return True
+
+
+def candidates_lm(
+    text,
+    style,
+    n=4,
+    seed=None,
+    model_name=None,
+    max_new_tokens=96,
+    lm_profile="legacy",
+    strict_quality=False,
+    min_semantic=0.45,
+    min_style=0.10,
+    min_length_ratio=0.5,
+):
+    profile = _resolve_profile(lm_profile, model_name)
+    tokenizer, model, is_seq2seq = _load_lm(profile["model_name"])
     prompt = _build_prompt(text, style)
-    input_ids = tokenizer(prompt, return_tensors="pt")
+    model_inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
+    model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
 
     candidates = []
+    rejected = []
     seen = set()
-    temp_cycle = [0.65, 0.75, 0.85, 0.95]
-    top_p_cycle = [0.88, 0.9, 0.93, 0.96]
+    temp_cycle = profile["temperatures"]
+    top_p_cycle = profile["top_ps"]
+    attempts = n + (12 if strict_quality else 4)
 
-    for i in range(n + 2):
+    for i in range(attempts):
         if len(candidates) >= n:
             break
         run_seed = seed + i if seed is not None else _stable_seed(f"{text}|{style}|{i}")
-        torch.manual_seed(run_seed)
+        generator = torch.Generator(device=model.device)
+        generator.manual_seed(run_seed)
 
         temperature = temp_cycle[i % len(temp_cycle)]
         top_p = top_p_cycle[i % len(top_p_cycle)]
 
         with torch.no_grad():
             output_ids = model.generate(
-                **input_ids,
+                **model_inputs,
                 do_sample=True,
                 temperature=temperature,
                 top_p=top_p,
-                repetition_penalty=1.12,
-                no_repeat_ngram_size=3,
+                repetition_penalty=profile["repetition_penalty"],
+                no_repeat_ngram_size=profile["no_repeat_ngram_size"],
                 max_new_tokens=max_new_tokens,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
+                generator=generator,
             )
 
         decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        cand = _extract_rewrite(prompt, decoded)
+        cand = decoded.strip() if is_seq2seq else _extract_rewrite(prompt, decoded)
         if not cand:
             continue
         if cand.lower() == text.lower():
             continue
         if cand in seen:
             continue
+        if strict_quality and not _passes_quality_filter(
+            text,
+            cand,
+            style,
+            min_semantic=min_semantic,
+            min_style=min_style,
+            min_length_ratio=min_length_ratio,
+        ):
+            rejected.append(cand)
+            continue
         seen.add(cand)
         candidates.append(cand)
 
     if not candidates:
-        candidates = [text]
+        if rejected:
+            candidates = rejected[:1]
+        else:
+            raise RuntimeError("No valid model generations were produced")
     return candidates
 
 
@@ -175,7 +271,12 @@ def generate_one(
     diversify=True,
     seed=None,
     n_candidates=4,
-    lm_model="distilgpt2",
+    lm_model=None,
+    lm_profile="legacy",
+    strict_quality=False,
+    min_semantic=0.45,
+    min_style=0.10,
+    min_length_ratio=0.5,
     max_new_tokens=96,
 ):
     style = normalize_style(style)
@@ -185,6 +286,11 @@ def generate_one(
         n=n_candidates,
         seed=seed,
         model_name=lm_model,
+        lm_profile=lm_profile,
+        strict_quality=strict_quality,
+        min_semantic=min_semantic,
+        min_style=min_style,
+        min_length_ratio=min_length_ratio,
         max_new_tokens=max_new_tokens,
     )
     ranked = rank_candidates(text, cands, style)
@@ -204,7 +310,12 @@ def pastiche(
     diversify=True,
     seed=None,
     n_candidates=4,
-    lm_model="distilgpt2",
+    lm_model=None,
+    lm_profile="legacy",
+    strict_quality=False,
+    min_semantic=0.45,
+    min_style=0.10,
+    min_length_ratio=0.5,
     max_new_tokens=96,
 ):
     """Rewrite input text in the requested author style.
@@ -225,6 +336,11 @@ def pastiche(
         seed=seed,
         n_candidates=n_candidates,
         lm_model=lm_model,
+        lm_profile=lm_profile,
+        strict_quality=strict_quality,
+        min_semantic=min_semantic,
+        min_style=min_style,
+        min_length_ratio=min_length_ratio,
         max_new_tokens=max_new_tokens,
     )
     return result["output"]
@@ -237,11 +353,21 @@ def main():
     parser.add_argument("--style", required=True, choices=["dosto", "dostoevsky", "proust"])
     parser.add_argument(
         "--lm_model",
-        default="distilgpt2",
+        default=None,
         help="Hugging Face model id for text generation",
+    )
+    parser.add_argument(
+        "--lm_profile",
+        default="legacy",
+        choices=sorted(MODEL_PROFILES.keys()),
+        help="Generation preset controlling default model and decoding strategy",
     )
     parser.add_argument("--n_candidates", type=int, default=4)
     parser.add_argument("--max_new_tokens", type=int, default=96)
+    parser.add_argument("--strict_quality", action="store_true")
+    parser.add_argument("--min_semantic", type=float, default=0.45)
+    parser.add_argument("--min_style", type=float, default=0.10)
+    parser.add_argument("--min_length_ratio", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--deterministic", action="store_true", help="Always pick top-ranked candidate")
     parser.add_argument("--text", help="Single input text")
@@ -276,6 +402,11 @@ def main():
             seed=args.seed,
             n_candidates=args.n_candidates,
             lm_model=args.lm_model,
+            lm_profile=args.lm_profile,
+            strict_quality=args.strict_quality,
+            min_semantic=args.min_semantic,
+            min_style=args.min_style,
+            min_length_ratio=args.min_length_ratio,
             max_new_tokens=args.max_new_tokens,
         )
         out.append(
