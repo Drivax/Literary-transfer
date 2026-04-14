@@ -137,16 +137,40 @@ def _style_instructions(style):
 
 
 def _build_prompt(text, style):
+    """Prompt for causal / decoder-only models (completion style)."""
     author = "Fyodor Dostoevsky" if style == "dostoevsky" else "Marcel Proust"
     return (
-        f"You are a literary style transfer model.\\n"
-        f"Target author: {author}.\\n"
-        f"Instruction: {_style_instructions(style)}\\n\\n"
-        "Rewrite the source text in the target style.\\n"
-        "Return only the rewritten text.\\n\\n"
-        f"Source text:\\n{text}\\n\\n"
-        "Rewritten text:\\n"
+        f"You are a literary style transfer model.\n"
+        f"Target author: {author}.\n"
+        f"Instruction: {_style_instructions(style)}\n\n"
+        "Rewrite the source text in the target style.\n"
+        "Return only the rewritten text.\n\n"
+        f"Source text:\n{text}\n\n"
+        "Rewritten text:\n"
     )
+
+
+def _build_prompt_seq2seq(text, style):
+    """Prompt for encoder-decoder (seq2seq) models such as T5/BART.
+
+    T5 receives the full instruction as encoder input and generates the
+    rewrite as a fresh decoder sequence — it does not 'continue' from a
+    prefix, so a concise task description works better than a completion
+    scaffold.
+    """
+    if style == "dostoevsky":
+        style_desc = (
+            "Rewrite the following text in the literary style of Fyodor Dostoevsky: "
+            "morally introspective, psychologically intense, dramatic, and serious. "
+            "Preserve the meaning exactly. Do not add new events."
+        )
+    else:
+        style_desc = (
+            "Rewrite the following text in the literary style of Marcel Proust: "
+            "long flowing sentences, reflective and memory-driven, rich sensory detail. "
+            "Preserve the meaning exactly. Do not add new events."
+        )
+    return f"{style_desc}\n\nText: {text}\n\nRewrite:"
 
 
 def _extract_rewrite(prompt, decoded):
@@ -167,7 +191,7 @@ def _extract_rewrite(prompt, decoded):
 def _passes_quality_filter(source, candidate, style, min_semantic, min_style, min_length_ratio):
     source_tokens = tokenize(source)
     cand_tokens = tokenize(candidate)
-    if len(cand_tokens) < 8:
+    if len(cand_tokens) < 6:
         return False
 
     semantic = rank_candidates(source, [candidate], style)[0][3]
@@ -181,7 +205,10 @@ def _passes_quality_filter(source, candidate, style, min_semantic, min_style, mi
         return False
     if length_ratio < min_length_ratio:
         return False
-    if distinct2 < 0.55:
+    # Scale the bigram diversity requirement with output length: very short
+    # outputs (≤ 20 tokens) cannot produce high distinct-2 by construction.
+    min_distinct2 = 0.55 if len(cand_tokens) > 20 else max(0.30, 0.55 * len(cand_tokens) / 20)
+    if distinct2 < min_distinct2:
         return False
     return True
 
@@ -201,7 +228,9 @@ def candidates_lm(
 ):
     profile = _resolve_profile(lm_profile, model_name)
     tokenizer, model, is_seq2seq = _load_lm(profile["model_name"])
-    prompt = _build_prompt(text, style)
+    # T5/BART encoder-decoder models need a task-instruction prompt, not a
+    # causal completion scaffold.
+    prompt = _build_prompt_seq2seq(text, style) if is_seq2seq else _build_prompt(text, style)
     model_inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
     model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
 

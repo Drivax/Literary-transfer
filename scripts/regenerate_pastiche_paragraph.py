@@ -24,12 +24,12 @@ def main():
                 n_candidates=3,
                 lm_profile="instruct",
                 strict_quality=True,
-                min_semantic=0.45,
-                min_style=0.10,
-                min_length_ratio=0.45,
-                max_new_tokens=90,
+                min_semantic=0.40,
+                min_style=0.08,
+                min_length_ratio=0.40,
+                max_new_tokens=110,
             )
-            lines.append(f"{label} #{idx}: {out}")
+            lines.append(f"{label} #{idx}:\n{out.strip()}")
 
     out_path = Path("outputs/pastiche_paragraph_outputs.txt")
     out_path.write_text("\n\n".join(lines) + "\n", encoding="utf-8")
